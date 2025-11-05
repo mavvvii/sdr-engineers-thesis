@@ -1,0 +1,27 @@
+[project]
+name = "sdr-engineers-thesis"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Hubert Kwiatek",email = "273197@student.pwr.edu.pl"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "pyhackrf (>=0.2.0,<0.3.0)",
+    "pyqt6 (>=6.10.0,<7.0.0)",
+    "pyqtgraph (>=0.13.7,<0.14.0)",
+    "numba (>=0.62.1,<0.63.0)",
+    "pybind11 (>=3.0.1,<4.0.0)",
+    "setuptools (>=80.9.0,<81.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "sdr_engineers_thesis", from = "src"}]
+
+# [tool.poetry.scripts]
+# sdr-app = "sdr_engineers_thesis.main:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
