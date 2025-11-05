@@ -19,8 +19,8 @@ dependencies = [
 [tool.poetry]
 packages = [{include = "sdr_engineers_thesis", from = "src"}]
 
-# [tool.poetry.scripts]
-# sdr-app = "sdr_engineers_thesis.main:main"
+[tool.poetry.scripts]
+sdr-app = "sdr_engineers_thesis.main:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
