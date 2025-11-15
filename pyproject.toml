@@ -25,3 +25,15 @@ sdr-app = "sdr_engineers_thesis.main:main"
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pre-commit (>=4.3.0,<5.0.0)",
+    "black (>=25.11.0,<26.0.0)",
+    "isort (>=7.0.0,<8.0.0)",
+    "mypy (>=1.18.2,<2.0.0)",
+    "flake8 (>=7.3.0,<8.0.0)",
+    "pydocstyle (>=6.3.0,<7.0.0)",
+    "pylint (>=4.0.3,<5.0.0)",
+    "bandit (>=1.8.6,<2.0.0)"
+]
