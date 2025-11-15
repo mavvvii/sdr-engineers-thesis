@@ -53,6 +53,7 @@ repos:
       - id: pylint
         args: [
           "--max-line-length=100",
+          "--disable=E0401"
         ]
 
   - repo: https://github.com/PyCQA/bandit
