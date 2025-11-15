@@ -40,7 +40,11 @@ repos:
     rev: 7.3.0
     hooks:
       - id: flake8
-        args : ["--show-source", "--max-line-length=100"]
+        args : [
+          "--show-source",
+          "--max-line-length=100",
+          "--ignore=E203"
+        ]
 
   - repo: https://github.com/pycqa/pydocstyle
     rev: 6.3.0
