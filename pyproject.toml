@@ -6,7 +6,7 @@ authors = [
     {name = "Hubert Kwiatek",email = "273197@student.pwr.edu.pl"}
 ]
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     "pyhackrf (>=0.2.0,<0.3.0)",
     "pyqt6 (>=6.10.0,<7.0.0)",

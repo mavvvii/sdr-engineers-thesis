@@ -5,7 +5,7 @@ import signal
 
 from PyQt6.QtWidgets import QApplication
 
-from sdr_engineers_thesis.gui.main_window import MainWindow
+from gui import MainWindow
 
 
 def apply_environment_optimizations() -> None:

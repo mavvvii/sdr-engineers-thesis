@@ -16,23 +16,23 @@ class SDRSettings:
     Attributes:
         center_freq: Default center frequency in Hz.
         sample_rates: List of sample rate options in MS/s.
-        sample_rate: Currently selected sample rate in Hz.
+        span: Currently selected sample rate in Hz.
         gain: Default LNA gain in dB.
         lna_gain: LNA gain value.
         vga_gain: VGA gain value.
     """
 
-    center_freq: float = 99.8e6
+    center_freq: float = 2442e6
     sample_rates: List[int] = field(default_factory=lambda: [2, 4, 8, 10])  # POPRAWIONE
-    sample_rate: int | None = None
-    gain: int = 30
-    lna_gain: int = 16
+    span: int | None = 60e6
+    gain: int = 16
+    lna_gain: int = 32
     vga_gain: int = 16
 
     def __post_init__(self):
-        """Ensure a default sample_rate is selected if not provided."""
-        if self.sample_rate is None:
-            self.sample_rate = int(self.sample_rates[2] * 1e6)
+        """Ensure a default span is selected if not provided."""
+        if self.span is None:
+            self.span = int(self.sample_rates[2] * 1e6)
 
 
 # ==================== PRZETWARZANIE ====================
@@ -53,8 +53,8 @@ class ProcessingSettings:
 class OptimizationSettings:
     """Flags enabling optional optimizations (fastfft, numba, overlap)."""
 
-    use_fastfft: bool = False
-    use_numba: bool = False
+    use_fastfft: bool = True
+    use_numba: bool = True
     use_overlap: bool = True
 
 
@@ -62,8 +62,8 @@ class OptimizationSettings:
 class MeasurementSettings:
     """Settings for channel power measurement ranges."""
 
-    channel_start_freq: float = 99.7e6
-    channel_end_freq: float = 100.0e6
+    channel_start_freq: float = 2412e6
+    channel_end_freq: float = 2480e6
 
     @property
     def measurement_bw(self) -> float:
@@ -79,7 +79,6 @@ class DisplaySettings:
     time_plot_range: tuple = (-1.1, 1.1)
     waterfall_range: tuple = (-100, 0)
     max_hold_enabled: bool = False
-    current_fps: float = 0.0
     measured_power: float = 0.0
 
 
@@ -105,4 +104,4 @@ class AppConfig:
     gui: GUISettings = field(default_factory=GUISettings)
 
 
-default_config = AppConfig()
+default_config: AppConfig = AppConfig()

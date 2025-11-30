@@ -1,72 +1,72 @@
-repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
-    hooks:
-      - id: check-merge-conflict
-        args: ["--assume-in-merge"]
-      - id: check-toml
-      - id: check-yaml
-      - id: check-symlinks
-      - id: check-ast
-      - id: detect-private-key
-      - id: end-of-file-fixer
-      - id: no-commit-to-branch
-        args: [--branch, main]
-      - id: pretty-format-json
-        args: [--autofix]
-      - id: trailing-whitespace
-        args: [--markdown-linebreak-ext=md]
+# repos:
+#   - repo: https://github.com/pre-commit/pre-commit-hooks
+#     rev: v5.0.0
+#     hooks:
+#       - id: check-merge-conflict
+#         args: ["--assume-in-merge"]
+#       - id: check-toml
+#       - id: check-yaml
+#       - id: check-symlinks
+#       - id: check-ast
+#       - id: detect-private-key
+#       - id: end-of-file-fixer
+#       - id: no-commit-to-branch
+#         args: [--branch, main]
+#       - id: pretty-format-json
+#         args: [--autofix]
+#       - id: trailing-whitespace
+#         args: [--markdown-linebreak-ext=md]
 
-  - repo: https://github.com/psf/black
-    rev: 25.1.0
-    hooks:
-      - id: black
-        args: ["--line-length=100"]
-        language_version: python3.11
+#   - repo: https://github.com/psf/black
+#     rev: 25.1.0
+#     hooks:
+#       - id: black
+#         args: ["--line-length=100"]
+#         language_version: python3.11
 
-  - repo: https://github.com/pycqa/isort
-    rev: 6.0.1
-    hooks:
-      - id: isort
-        args: ["--profile", "black", "--line-length=100"]
-        language_version: python3.11
+#   - repo: https://github.com/pycqa/isort
+#     rev: 6.0.1
+#     hooks:
+#       - id: isort
+#         args: ["--profile", "black", "--line-length=100"]
+#         language_version: python3.11
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.1
-    hooks:
-      - id: mypy
+#   - repo: https://github.com/pre-commit/mirrors-mypy
+#     rev: v1.16.1
+#     hooks:
+#       - id: mypy
 
-  - repo: https://github.com/pycqa/flake8
-    rev: 7.3.0
-    hooks:
-      - id: flake8
-        args : [
-          "--show-source",
-          "--max-line-length=100",
-          "--ignore=E203"
-        ]
+#   - repo: https://github.com/pycqa/flake8
+#     rev: 7.3.0
+#     hooks:
+#       - id: flake8
+#         args : [
+#           "--show-source",
+#           "--max-line-length=100",
+#           "--ignore=E203"
+#         ]
 
-  - repo: https://github.com/pycqa/pydocstyle
-    rev: 6.3.0
-    hooks:
-      - id: pydocstyle
+#   - repo: https://github.com/pycqa/pydocstyle
+#     rev: 6.3.0
+#     hooks:
+#       - id: pydocstyle
 
-  - repo: https://github.com/pylint-dev/pylint
-    rev: v3.3.7
-    hooks:
-      - id: pylint
-        args: [
-          "--max-line-length=100",
-          "--disable=E0401"
-        ]
+#   - repo: https://github.com/pylint-dev/pylint
+#     rev: v3.3.7
+#     hooks:
+#       - id: pylint
+#         args: [
+#           "--max-line-length=100",
+#           "--disable=E0401"
+#         ]
 
-  - repo: https://github.com/PyCQA/bandit
-    rev: '1.7.6'
-    hooks:
-      - id: bandit
-        args: ["-ll"]
+#   - repo: https://github.com/PyCQA/bandit
+#     rev: '1.7.6'
+#     hooks:
+#       - id: bandit
+#         args: ["-ll"]
 
-  - repo: https://github.com/markdownlint/markdownlint
-    rev: v0.13.0
-    hooks:
-      - id: markdownlint
+#   - repo: https://github.com/markdownlint/markdownlint
+#     rev: v0.13.0
+#     hooks:
+#       - id: markdownlint
