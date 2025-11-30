@@ -7,12 +7,14 @@ controls for interacting with the SDR worker.
 #  pylint: disable=R0902, R0904, R0915
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QSize, Qt, QThread, QTimer
+from PyQt6.QtCore import QSize, Qt, QThread, QTimer, QRectF
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QGridLayout,
+    QToolButton,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -24,12 +26,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import math
+
 from sdr_engineers_thesis.core.sdr_worker import SDRWorker
 from sdr_engineers_thesis.utils.config import default_config
 
 
 class MainWindow(QMainWindow):
     """Application main window hosting plots and controls."""
+
+    RBW_FFT_MAX = 262_144  # safety cap for huge FFT sizes to avoid OOM
+    MAX_DEVICE_SPAN_HZ = 20_000_000  # HackRF One limitation per capture
 
     def __init__(self):
         """Initialize UI, menu and background worker thread."""
@@ -40,18 +47,31 @@ class MainWindow(QMainWindow):
         # Initialize core attributes
         self.spectrogram_min = -100.0
         self.spectrogram_max = 0.0
-        self.current_fps = 0
+        self.current_sweep_ms = 0.0
         self.channel_power = 0.0
 
         self.time_plot = None
         self.time_curve_i = None
         self.time_curve_q = None
         self.freq_plot = None
-        self.freq_curve = None
+        self.freq_curve_current = None
+        self.freq_curve_avg = None
+        self.freq_curve_max = None
+        self.marker_line_v = None
+        self.marker_line_h = None
+        self.marker_label = None
+        self.marker_freq_mhz = None
+        self.marker_power_dbm = None
+        self.last_freq_axis = None
+        self.last_psd_current = None
+        self.last_psd_avg = None
+        self.last_psd_max = None
         self.channel_region = None
         self.waterfall_plot = None
         self.imageitem = None
         self.colorbar = None
+        self.last_waterfall_data = None
+        self.wf_cmap_combo = None
 
         # Initialize all UI components in __init__
         self._initialize_ui_components()
@@ -59,6 +79,7 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.setup_menu()
         self.setup_worker()
+        self._tune_layout_spacing()
 
     def _initialize_ui_components(self):
         """Initialize all UI components to avoid attribute-defined-outside-init."""
@@ -75,25 +96,27 @@ class MainWindow(QMainWindow):
 
         # Status labels
         self.status_label = QLabel("Ready")
-        self.performance_label = QLabel("FPS: 0.0")
+        self.performance_label = QLabel("Sweep time: -- ms")
         self.channel_power_label = QLabel("Channel Power: -- dBm")
 
-        # Frequency controls
-        self.freq_label = QLabel(f"Frequency: {default_config.hardware.center_freq / 1e6:.3f} MHz")
-        self.freq_slider = QSlider(Qt.Orientation.Horizontal)
-        self.freq_spinbox = QDoubleSpinBox()
+        # Frequency controls (center)
+        center_mhz = default_config.hardware.center_freq / 1e6
+        self.freq_label = QLabel(f"Center: {center_mhz:.3f} MHz")
+        self.center_freq_spin = QDoubleSpinBox()
+        self.center_freq_spin.setSingleStep(0.1)
+        self.center_freq_spin.setKeyboardTracking(False)
 
-        # Gain controls
-        self.gain_label = QLabel(f"Gain: {default_config.hardware.gain} dB")
+        # Gain controls (VGA)
+        self.gain_label = QLabel(f"VGA Gain: {default_config.hardware.vga_gain} dB")
         self.gain_slider = QSlider(Qt.Orientation.Horizontal)
 
-        # SPAN/RBW/Sweep controls
+        # SPAN/RBW controls
         self.span_spin = QDoubleSpinBox()
+        self.span_spin.setKeyboardTracking(False)
         self.span_unit = QComboBox()
         self.rbw_spin = QDoubleSpinBox()
+        self.rbw_spin.setKeyboardTracking(False)
         self.rbw_unit = QComboBox()
-        self.sweep_spin = QDoubleSpinBox()
-        self.sweep_unit = QComboBox()
 
         # Channel power measurement
         self.channel_start_spin = QDoubleSpinBox()
@@ -102,7 +125,6 @@ class MainWindow(QMainWindow):
         self.measured_power_label = QLabel("Power: -- dBm")
 
         # FFT settings
-        self.fft_avg_spin = QSpinBox()
         self.waterfall_speed_spin = QSpinBox()
 
         # Display modes
@@ -121,6 +143,11 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         """Create and arrange all UI widgets and plots."""
         layout = QGridLayout()
+        layout.setHorizontalSpacing(16)
+        layout.setVerticalSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setColumnStretch(0, 2)
+        layout.setColumnStretch(1, 1)
 
         # Worker setup
         self.worker.moveToThread(self.sdr_thread)
@@ -137,6 +164,17 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
+
+    def _tune_layout_spacing(self):
+        """Lightweight visual tuning for a cleaner UI."""
+        self.setStyleSheet(
+            """
+            QGroupBox { font-weight: bold; }
+            QLabel { font-size: 12px; }
+            QDoubleSpinBox, QSpinBox { min-height: 26px; }
+            QPushButton { min-height: 28px; }
+            """
+        )
 
     def _create_time_plot(self, layout):
         """Create time domain plot."""
@@ -156,8 +194,18 @@ class MainWindow(QMainWindow):
         freq_group = QGroupBox("Frequency Domain")
         freq_layout = QVBoxLayout()
         self.freq_plot = pg.PlotWidget(labels={"left": "PSD (dB)", "bottom": "Frequency [MHz]"})
-        self.freq_curve = self.freq_plot.plot(pen="g")
+        self.freq_curve_current = self.freq_plot.plot(pen=pg.mkPen("g", width=1.5))
+        self.freq_curve_avg = self.freq_plot.plot(pen=pg.mkPen("y", width=1.2))
+        self.freq_curve_max = self.freq_plot.plot(pen=pg.mkPen("r", width=1.0))
+        self.marker_line_v = pg.InfiniteLine(angle=90, pen=pg.mkPen("w", style=Qt.PenStyle.DotLine))
+        self.marker_line_h = pg.InfiniteLine(angle=0, pen=pg.mkPen("w", style=Qt.PenStyle.DotLine))
+        self.marker_label = pg.TextItem(color="w", anchor=(0, 1))
+        self.freq_plot.addItem(self.marker_line_v)
+        self.freq_plot.addItem(self.marker_line_h)
+        self.freq_plot.addItem(self.marker_label)
         self.freq_plot.setYRange(-120, 30)
+        # Keep Y axis fixed instead of auto-rescaling to current trace
+        self.freq_plot.enableAutoRange(axis="y", enable=False)
         self.freq_plot.showGrid(x=True, y=True, alpha=0.3)
 
         # Add channel region
@@ -190,6 +238,7 @@ class MainWindow(QMainWindow):
         waterfall_layout.addWidget(self.waterfall_plot)
         waterfall_group.setLayout(waterfall_layout)
         layout.addWidget(waterfall_group, 2, 0)
+        self._update_waterfall_freq_range()
 
     def create_controls_panel(self):
         """Create the right-hand controls panel widget and return it."""
@@ -202,8 +251,7 @@ class MainWindow(QMainWindow):
         self._create_gain_group(controls_layout)
         self._create_span_group(controls_layout)
         self._create_power_group(controls_layout)
-        self._create_fft_group(controls_layout)
-        self._create_mode_group(controls_layout)
+        self._create_display_group(controls_layout)
         self._create_waterfall_group(controls_layout)
 
         controls_layout.addStretch()
@@ -227,19 +275,25 @@ class MainWindow(QMainWindow):
 
         freq_layout.addWidget(self.freq_label)
 
-        self.freq_slider.setRange(1_000, 6_000_000)
-        self.freq_slider.setValue(int(default_config.hardware.center_freq / 1e3))
-        self.freq_slider.sliderMoved.connect(self.on_freq_slider_moved)
-        freq_layout.addWidget(self.freq_slider)
+        self.center_freq_spin.setRange(1.0, 6000.0)
+        self.center_freq_spin.setDecimals(6)
+        self.center_freq_spin.setSuffix(" MHz")
 
-        self.freq_spinbox.setRange(1.0, 6000.0)
-        self.freq_spinbox.setValue(default_config.hardware.center_freq / 1e6)
-        self.freq_spinbox.setSuffix(" MHz")
-        self.freq_spinbox.valueChanged.connect(self.on_freq_spinbox_changed)
-        freq_layout.addWidget(self.freq_spinbox)
+        center = default_config.hardware.center_freq / 1e6
+        self.center_freq_spin.setValue(center)
+        self._update_freq_label(center)
+
+        self.center_freq_spin.valueChanged.connect(self.on_center_changed)
+
+        center_layout = QHBoxLayout()
+        center_layout.addWidget(QLabel("Center:"))
+        center_layout.addWidget(self.center_freq_spin)
+        freq_layout.addLayout(center_layout)
 
         freq_group.setLayout(freq_layout)
         parent_layout.addWidget(freq_group)
+        # klik na wykresie centrumje widok i ustawia marker
+        self.freq_plot.scene().sigMouseClicked.connect(self._handle_freq_click)
 
     def _create_gain_group(self, parent_layout):
         """Create gain settings group."""
@@ -248,8 +302,10 @@ class MainWindow(QMainWindow):
 
         gain_layout.addWidget(self.gain_label)
 
-        self.gain_slider.setRange(0, 40)
-        self.gain_slider.setValue(default_config.hardware.gain)
+        self.gain_slider.setRange(0, 62)
+        self.gain_slider.setValue(default_config.hardware.vga_gain)
+        self.gain_slider.setSingleStep(2)
+        self.gain_slider.setPageStep(2)
         self.gain_slider.sliderMoved.connect(self.on_gain_slider_moved)
         gain_layout.addWidget(self.gain_slider)
 
@@ -257,15 +313,16 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(gain_group)
 
     def _create_span_group(self, parent_layout):
-        """Create SPAN/RBW/Sweep group."""
-        span_group = QGroupBox("SPAN / RBW / Sweep")
+        """Create SPAN/RBW group."""
+        span_group = QGroupBox("SPAN / RBW")
         span_layout = QVBoxLayout()
 
         # SPAN controls
         span_hbox = QHBoxLayout()
-        self.span_spin.setRange(0.0001, 100000.0)
-        self.span_spin.setDecimals(6)
-        self.span_spin.setValue(default_config.hardware.sample_rate / 1e6)
+        self.span_spin.setRange(1, 100000.0)
+        self.span_spin.setDecimals(0)
+        self.span_spin.setSingleStep(1)
+        self.span_spin.setValue(int(default_config.hardware.span / 1e6))
         self.span_unit.addItems(["Hz", "kHz", "MHz"])
         self.span_unit.setCurrentText("MHz")
         self.span_spin.valueChanged.connect(self.on_span_changed)
@@ -277,32 +334,21 @@ class MainWindow(QMainWindow):
 
         # RBW controls
         rbw_hbox = QHBoxLayout()
-        self.rbw_spin.setRange(0.000001, 100000.0)
-        self.rbw_spin.setDecimals(6)
-        init_rbw_hz = default_config.hardware.sample_rate / default_config.processing.fft_size
-        self.rbw_spin.setValue(init_rbw_hz / 1e3)
-        self.rbw_unit.addItems(["Hz", "kHz", "MHz"])
-        self.rbw_unit.setCurrentText("kHz")
-        self.rbw_spin.valueChanged.connect(self.on_rbw_changed)
-        self.rbw_unit.currentTextChanged.connect(self.on_rbw_changed)
-        rbw_hbox.addWidget(QLabel("RBW:"))
-        rbw_hbox.addWidget(self.rbw_spin)
-        rbw_hbox.addWidget(self.rbw_unit)
+        self.rbw_label = QLabel("RBW: --")
+        rbw_hbox.addWidget(self.rbw_label)
+        self.rbw_down_btn = QToolButton()
+        self.rbw_down_btn.setText("RBW -")
+        self.rbw_up_btn = QToolButton()
+        self.rbw_up_btn.setText("RBW +")
+        # RBW + => większe RBW (mniejsza FFT), RBW - => mniejsze RBW (większa FFT)
+        self.rbw_up_btn.clicked.connect(lambda: self._rbw_step(+1))
+        self.rbw_down_btn.clicked.connect(lambda: self._rbw_step(-1))
+        rbw_hbox.addWidget(self.rbw_down_btn)
+        rbw_hbox.addWidget(self.rbw_up_btn)
         span_layout.addLayout(rbw_hbox)
 
-        # Sweep controls
-        sweep_hbox = QHBoxLayout()
-        self.sweep_spin.setRange(0.0, 3600.0)
-        self.sweep_spin.setDecimals(3)
-        self.sweep_spin.setValue(0.0)
-        self.sweep_unit.addItems(["ms", "s", "min"])
-        self.sweep_unit.setCurrentText("s")
-        self.sweep_spin.valueChanged.connect(self.on_sweep_time_changed)
-        self.sweep_unit.currentTextChanged.connect(self.on_sweep_time_changed)
-        sweep_hbox.addWidget(QLabel("Sweep Time:"))
-        sweep_hbox.addWidget(self.sweep_spin)
-        sweep_hbox.addWidget(self.sweep_unit)
-        span_layout.addLayout(sweep_hbox)
+        # startowa wartość RBW
+        self._update_rbw_display(default_config.hardware.span)
 
         span_group.setLayout(span_layout)
         parent_layout.addWidget(span_group)
@@ -335,39 +381,38 @@ class MainWindow(QMainWindow):
         power_group.setLayout(power_layout)
         parent_layout.addWidget(power_group)
 
-    def _create_fft_group(self, parent_layout):
-        """Create FFT settings group."""
-        fft_group = QGroupBox("FFT Settings")
-        fft_layout = QVBoxLayout()
+    def _create_display_group(self, parent_layout):
+        """Create display settings group (layers, modes, marker)."""
+        disp_group = QGroupBox("Display Settings")
+        disp_layout = QVBoxLayout()
 
-        self.fft_avg_spin.setRange(1, 16)
-        self.fft_avg_spin.setValue(1)
-        self.fft_avg_spin.valueChanged.connect(self.worker.set_fft_averages)
-        fft_layout.addWidget(QLabel("FFT Averages:"))
-        fft_layout.addWidget(self.fft_avg_spin)
+        # Layer visibility checkboxes
+        self.show_current_cb = QCheckBox("Show Current (green)")
+        self.show_current_cb.setChecked(True)
+        self.show_current_cb.stateChanged.connect(self._toggle_current_curve)
+        disp_layout.addWidget(self.show_current_cb)
 
-        self.waterfall_speed_spin.setRange(1, 10)
-        self.waterfall_speed_spin.setValue(1)
-        self.waterfall_speed_spin.valueChanged.connect(self.worker.set_waterfall_speed)
-        fft_layout.addWidget(QLabel("Waterfall Speed:"))
-        fft_layout.addWidget(self.waterfall_speed_spin)
+        self.show_avg_cb = QCheckBox("Show Average (yellow)")
+        self.show_avg_cb.setChecked(True)
+        self.show_avg_cb.stateChanged.connect(self._toggle_avg_curve)
+        disp_layout.addWidget(self.show_avg_cb)
 
-        fft_group.setLayout(fft_layout)
-        parent_layout.addWidget(fft_group)
-
-    def _create_mode_group(self, parent_layout):
-        """Create display modes group."""
-        mode_group = QGroupBox("Display Modes")
-        mode_layout = QVBoxLayout()
-
-        self.mode_btn.clicked.connect(self.toggle_mode)
-        mode_layout.addWidget(self.mode_btn)
+        self.show_max_cb = QCheckBox("Show Max Hold (red)")
+        self.show_max_cb.setChecked(True)
+        self.show_max_cb.stateChanged.connect(self._toggle_max_curve)
+        disp_layout.addWidget(self.show_max_cb)
 
         self.max_hold_btn.clicked.connect(self.clear_max_hold)
-        mode_layout.addWidget(self.max_hold_btn)
+        disp_layout.addWidget(self.max_hold_btn)
 
-        mode_group.setLayout(mode_layout)
-        parent_layout.addWidget(mode_group)
+        # Marker toggle
+        self.marker_cb = QCheckBox("Show marker")
+        self.marker_cb.setChecked(True)
+        self.marker_cb.stateChanged.connect(self._toggle_marker)
+        disp_layout.addWidget(self.marker_cb)
+
+        disp_group.setLayout(disp_layout)
+        parent_layout.addWidget(disp_group)
 
     def _create_waterfall_group(self, parent_layout):
         """Create waterfall controls group."""
@@ -376,6 +421,14 @@ class MainWindow(QMainWindow):
 
         self.auto_range_btn.clicked.connect(self.auto_range)
         wf_layout.addWidget(self.auto_range_btn)
+
+        # Colormap selector
+        self.wf_cmap_combo = QComboBox()
+        self.wf_cmap_combo.addItems(["viridis", "plasma", "inferno", "magma", "cividis", "turbo"])
+        self.wf_cmap_combo.setCurrentText("viridis")
+        self.wf_cmap_combo.currentTextChanged.connect(self._apply_waterfall_cmap)
+        wf_layout.addWidget(QLabel("Waterfall Colormap:"))
+        wf_layout.addWidget(self.wf_cmap_combo)
 
         self.wf_min_spin.setRange(-200, 200)
         self.wf_min_spin.setValue(self.spectrogram_min)
@@ -415,7 +468,7 @@ class MainWindow(QMainWindow):
         self.worker.freq_plot_update.connect(self.on_freq_update)
         self.worker.waterfall_plot_update.connect(self.on_waterfall_update)
         self.worker.status_update.connect(self.on_status_update)
-        self.worker.performance_update.connect(self.on_performance_update)
+        self.worker.sweep_time_update.connect(self.on_sweep_time_update)
         self.worker.channel_power_update.connect(self.on_channel_power_update)
         self.worker.end_of_run.connect(self.schedule_worker)
 
@@ -423,23 +476,27 @@ class MainWindow(QMainWindow):
         self.sdr_thread.started.connect(self.worker.run)
         self.sdr_thread.start()
 
-    def on_freq_slider_moved(self, value):
-        """Handle frequency slider movement and update UI/worker."""
-        freq_mhz = value / 1e3
-        self.freq_label.setText(f"Frequency: {freq_mhz:.3f} MHz")
-        self.freq_spinbox.setValue(freq_mhz)
-        self.worker.update_freq(value)
-
-    def on_freq_spinbox_changed(self, value):
-        """Handle frequency spinbox change and sync slider/worker."""
-        value_khz = int(value * 1000)
-        self.freq_slider.setValue(value_khz)
-        self.worker.update_freq(value_khz)
+    def on_center_changed(self, _=None):
+        """Update center/span when center frequency changes."""
+        center_mhz = self.center_freq_spin.value()
+        span_hz = self.span_spin.value() * self._unit_multiplier(self.span_unit.currentText())
+        span_hz = float(max(100.0, min(100_000_000.0, span_hz)))
+        start_mhz = center_mhz - span_hz / 2e6
+        stop_mhz = center_mhz + span_hz / 2e6
+        center_hz = center_mhz * 1e6
+        self._apply_span_and_rbw(span_hz, center_hz, start_mhz, stop_mhz)
+        self.freq_plot.setXRange(start_mhz, stop_mhz, padding=0)
+        self._update_waterfall_freq_range(start_mhz, stop_mhz)
 
     def on_gain_slider_moved(self, value):
         """Handle gain slider changes and update worker."""
-        self.gain_label.setText(f"Gain: {value} dB")
-        self.worker.update_gain(value)
+        even_val = int(value) - int(value) % 2
+        if even_val != value:
+            self.gain_slider.blockSignals(True)
+            self.gain_slider.setValue(even_val)
+            self.gain_slider.blockSignals(False)
+        self.gain_label.setText(f"VGA Gain: {even_val} dB")
+        self.worker.update_gain(even_val)
 
     def _unit_multiplier(self, unit_text: str) -> float:
         """Get multiplier for frequency units."""
@@ -451,6 +508,69 @@ class MainWindow(QMainWindow):
             return 1e6
         return 1.0
 
+    def _update_freq_label(self, center_mhz: float) -> None:
+        """Refresh center label text."""
+        self.freq_label.setText(f"Center: {center_mhz:.3f} MHz")
+
+    def _recenter_frequency_view(self, _event=None) -> None:
+        """Center frequency plot x-range to current start/stop."""
+        center_mhz = self.center_freq_spin.value()
+        span_hz = self.span_spin.value() * self._unit_multiplier(self.span_unit.currentText())
+        span_hz = float(max(100.0, min(100_000_000.0, span_hz)))
+        start_mhz = center_mhz - span_hz / 2e6
+        stop_mhz = center_mhz + span_hz / 2e6
+        self.freq_plot.setXRange(start_mhz, stop_mhz, padding=0)
+        self._update_freq_label(center_mhz)
+        self._update_waterfall_freq_range(start_mhz, stop_mhz)
+
+    def _handle_freq_click(self, event):
+        """On click: center view and set marker at clicked x, current y."""
+        if self.freq_plot.sceneBoundingRect().contains(event.scenePos()):
+            mouse_point = self.freq_plot.plotItem.vb.mapSceneToView(event.scenePos())
+            freq_mhz = mouse_point.x()
+            power_dbm = mouse_point.y()
+            voltage_text = self._dbm_to_voltage_text(power_dbm)
+            # update marker position
+            self.marker_freq_mhz = freq_mhz
+            self.marker_power_dbm = power_dbm
+            if self.marker_line_v:
+                self.marker_line_v.setValue(freq_mhz)
+            if self.marker_line_h:
+                self.marker_line_h.setValue(power_dbm)
+            if self.marker_label:
+                self.marker_label.setText(
+                    f"f={freq_mhz:.3f} MHz, P={power_dbm:.2f} dBm, {voltage_text}"
+                )
+                self.marker_label.setPos(freq_mhz, power_dbm)
+            # recenter view around click
+            self._recenter_frequency_view()
+
+    def _apply_span_and_rbw(self, span_hz: float, center_hz: float, start_mhz: float, stop_mhz: float) -> None:
+        """Apply span/sample rate and RBW-derived FFT size to the worker."""
+        # clamp span for device limits (całość widma, okna dzielone do 20 MHz)
+        span_hz = float(max(100.0, min(100_000_000.0, span_hz)))
+
+        rbw_val = self.rbw_spin.value()
+        rbw_hz = rbw_val * self._unit_multiplier(self.rbw_unit.currentText())
+        # derive FFT size so RBW ~= rbw_hz (span/fft_size), allow large sizes
+        desired_fft = int(math.ceil(span_hz / max(rbw_hz, 1e-9)))
+        fft_pow = 1 << (int(desired_fft) - 1).bit_length()  # power-of-two for speed
+        desired_fft = max(128, min(self.RBW_FFT_MAX, fft_pow))
+
+        try:
+            self.worker.update_span_value(int(span_hz))
+            self.worker.set_fft_size(desired_fft)
+            self.worker.update_center_freq(int(center_hz / 1e3))
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        # refresh UI labels/spins
+        self._update_freq_label(center_hz / 1e6)
+        self._update_span_display(span_hz)
+        self._update_rbw_display(span_hz)
+        self.freq_plot.setXRange(start_mhz, stop_mhz, padding=0)
+        self._update_waterfall_freq_range(start_mhz, stop_mhz)
+
     def on_span_changed(self, _=None):
         """Compute displayed span in Hz, clamp to valid range and update worker."""
         # compute span in Hz from spin + unit
@@ -458,72 +578,137 @@ class MainWindow(QMainWindow):
         span_hz = span_val * self._unit_multiplier(self.span_unit.currentText())
         # clamp to [100 Hz, 100 MHz]
         span_hz = max(100.0, min(100_000_000.0, span_hz))
-        # update worker (sample_rate = span)
-        try:
-            self.worker.update_sample_rate_value(int(span_hz))
-        except Exception:  # pylint: disable=broad-except
-            pass
-        # update RBW display
-        self._update_rbw_display(span_hz)
+        center_mhz = self.center_freq_spin.value()
+        start_mhz = center_mhz - span_hz / 2e6
+        stop_mhz = center_mhz + span_hz / 2e6
+        center_hz = center_mhz * 1e6
+        self._apply_span_and_rbw(span_hz, center_hz, start_mhz, stop_mhz)
+        self.freq_plot.setXRange(start_mhz, stop_mhz, padding=0)
+        self._update_waterfall_freq_range(start_mhz, stop_mhz)
 
     def _update_rbw_display(self, span_hz):
         """Update RBW display based on span."""
-        rbw_hz = span_hz / default_config.processing.fft_size
+        if not hasattr(self, "rbw_label"):
+            return
+        # efektywny RBW liczony na pojedynczym oknie (<=20 MHz)
+        windows = getattr(self.worker, "windows", [])
+        if windows:
+            fft_size = windows[0].fft_size
+            window_span = windows[0].span_hz
+        else:
+            fft_size = default_config.processing.fft_size
+            window_span = min(span_hz, self.MAX_DEVICE_SPAN_HZ)
+        rbw_hz = window_span / float(max(1, fft_size))
         # choose a friendly unit for rbw display
         if rbw_hz >= 1e6:
-            self.rbw_unit.setCurrentText("MHz")
-            self.rbw_spin.setValue(rbw_hz / 1e6)
+            text_val, unit = rbw_hz / 1e6, "MHz"
         elif rbw_hz >= 1e3:
-            self.rbw_unit.setCurrentText("kHz")
-            self.rbw_spin.setValue(rbw_hz / 1e3)
+            text_val, unit = rbw_hz / 1e3, "kHz"
         else:
-            self.rbw_unit.setCurrentText("Hz")
-            self.rbw_spin.setValue(rbw_hz)
+            text_val, unit = rbw_hz, "Hz"
+        self.rbw_label.setText(f"RBW: {text_val:.2f} {unit}")
 
     def on_rbw_changed(self, _=None):
-        """Handle RBW control changes and update sample rate/span accordingly."""
+        """Handle RBW control changes (RBW drives effective sample rate)."""
         rbw_val = self.rbw_spin.value()
         rbw_hz = rbw_val * self._unit_multiplier(self.rbw_unit.currentText())
-        # desired sample rate = rbw * fft_size
-        desired_sr = rbw_hz * default_config.processing.fft_size
-        # clamp to [100 Hz, 100 MHz]
-        desired_sr = max(100.0, min(100_000_000.0, desired_sr))
+        center_mhz = self.center_freq_spin.value()
+        span_hz = max(100.0, min(100_000_000.0, self.span_spin.value() * self._unit_multiplier(self.span_unit.currentText())))
+        start_mhz = center_mhz - span_hz / 2e6
+        stop_mhz = center_mhz + span_hz / 2e6
+
+        # derive FFT size so RBW ~= rbw_hz (span/fft_size)
+        desired_fft = int(math.ceil(span_hz / max(rbw_hz, 1e-9)))
+        fft_pow = 1 << (int(desired_fft) - 1).bit_length()  # power-of-two for speed
+        desired_fft = max(128, min(self.RBW_FFT_MAX, fft_pow))
+
+        span_hz = min(span_hz, 100_000_000.0)
         try:
-            self.worker.update_sample_rate_value(int(desired_sr))
+            self.worker.update_span_value(int(span_hz))
+            self.worker.set_fft_size(desired_fft)
         except Exception:  # pylint: disable=broad-except
             pass
-        # update SPAN display
-        self._update_span_display(desired_sr)
+
+        self._update_freq_label(center_mhz)
+        self._update_span_display(span_hz)
+        center_hz = center_mhz * 1e6
+        self.worker.update_center_freq(int(center_hz / 1e3))
+        self._update_rbw_display(span_hz)
+
+        # Faktyczne RBW po uwzględnieniu ograniczeń FFT (span/fft_size okna)
+        windows = getattr(self.worker, "windows", [])
+        if windows:
+            fft_size_actual = windows[0].fft_size
+            window_span = windows[0].span_hz
+        else:
+            fft_size_actual = desired_fft
+            window_span = min(span_hz, self.MAX_DEVICE_SPAN_HZ)
+        actual_rbw = window_span / float(max(1, fft_size_actual))
+        readable = actual_rbw
+        if readable >= 1e6:
+            text_val, unit = readable / 1e6, "MHz"
+        elif readable >= 1e3:
+            text_val, unit = readable / 1e3, "kHz"
+        else:
+            text_val, unit = readable, "Hz"
+        self.status_label.setText(f"RBW set to {text_val:.3f} {unit}")
+        self.rbw_label.setText(f"RBW: {text_val:.2f} {unit}")
+
+    def _rbw_step(self, direction: int):
+        """Adjust RBW via FFT size steps (direction>0 => większe RBW = mniejsze FFT)."""
+        windows = getattr(self.worker, "windows", [])
+        current_fft = windows[0].fft_size if windows else getattr(self.worker, "fft_size", 8192)
+        if direction > 0:
+            new_fft = max(128, current_fft // 2)
+        else:
+            new_fft = min(self.RBW_FFT_MAX, current_fft * 2)
+        if new_fft == current_fft:
+            return
+        # ustaw FFT i zaktualizuj widoki
+        try:
+            self.worker.set_fft_size(new_fft)
+        except Exception:
+            return
+        span_hz = getattr(self.worker, "span", 0)
+        self._update_rbw_display(span_hz)
+        self._recenter_frequency_view()
+        self.status_label.setText(f"FFT size set to {new_fft}")
 
     def _update_span_display(self, desired_sr):
         """Update SPAN display based on desired sample rate."""
+        self.span_spin.blockSignals(True)
+        self.span_unit.blockSignals(True)
         if desired_sr >= 1e6:
             self.span_unit.setCurrentText("MHz")
-            self.span_spin.setValue(desired_sr / 1e6)
+            self.span_spin.setValue(int(round(desired_sr / 1e6)))
         elif desired_sr >= 1e3:
             self.span_unit.setCurrentText("kHz")
-            self.span_spin.setValue(desired_sr / 1e3)
+            self.span_spin.setValue(int(round(desired_sr / 1e3)))
         else:
             self.span_unit.setCurrentText("Hz")
-            self.span_spin.setValue(desired_sr)
+            self.span_spin.setValue(int(round(desired_sr)))
+        self.span_unit.blockSignals(False)
+        self.span_spin.blockSignals(False)
+        # zaktualizuj RBW label i oś waterfall
+        self._update_rbw_display(desired_sr)
+        self._update_waterfall_freq_range()
 
-    def on_sweep_time_changed(self, _=None):
-        """Convert sweep time UI inputs into seconds and store on the worker."""
-        val = self.sweep_spin.value()
-        unit = self.sweep_unit.currentText()
-        if unit == "ms":
-            seconds = val / 1000.0
-        elif unit == "s":
-            seconds = val
-        elif unit == "min":
-            seconds = val * 60.0
-        else:
-            seconds = val
-        # store on worker for later use
-        try:
-            self.worker.sweep_time_seconds = float(seconds)
-        except Exception:  # pylint: disable=broad-except
-            pass
+    def _update_waterfall_freq_range(self, start_mhz: float | None = None, stop_mhz: float | None = None):
+        """Align waterfall X-range and image rect to current span."""
+        if start_mhz is None or stop_mhz is None:
+            center_mhz = self.center_freq_spin.value()
+            span_hz = self.span_spin.value() * self._unit_multiplier(self.span_unit.currentText())
+            span_hz = float(max(100.0, min(100_000_000.0, span_hz)))
+            start_mhz = center_mhz - span_hz / 2e6
+            stop_mhz = center_mhz + span_hz / 2e6
+        width_mhz = stop_mhz - start_mhz
+        if self.waterfall_plot:
+            self.waterfall_plot.setXRange(start_mhz, stop_mhz, padding=0)
+        # setRect tylko gdy znamy rozmiar obrazu
+        if self.imageitem and getattr(self.imageitem, "image", None) is not None:
+            height_rows = self.imageitem.image.shape[0]
+            self.imageitem.setRect(QRectF(start_mhz, 0, width_mhz, height_rows))
+            self.imageitem.update()
 
     def on_channel_region_changed(self):
         """Update channel range when region is moved."""
@@ -552,6 +737,39 @@ class MainWindow(QMainWindow):
         self.measured_power_label.setText(f"Power: {power:.2f} dBm")
         self.channel_power_label.setText(f"Channel Power: {power:.2f} dBm")
 
+    def _toggle_current_curve(self, state):
+        if self.freq_curve_current:
+            enable = state != 0
+            if enable and self.last_freq_axis is not None and self.last_psd_current is not None:
+                n = min(len(self.last_freq_axis), len(self.last_psd_current))
+                self.freq_curve_current.setData(self.last_freq_axis[:n], self.last_psd_current[:n])
+            self.freq_curve_current.setVisible(enable)
+
+    def _toggle_avg_curve(self, state):
+        if self.freq_curve_avg:
+            enable = state != 0
+            if enable and self.last_freq_axis is not None and self.last_psd_avg is not None:
+                n = min(len(self.last_freq_axis), len(self.last_psd_avg))
+                self.freq_curve_avg.setData(self.last_freq_axis[:n], self.last_psd_avg[:n])
+            self.freq_curve_avg.setVisible(enable)
+
+    def _toggle_max_curve(self, state):
+        if self.freq_curve_max:
+            enable = state != 0
+            if enable and self.last_freq_axis is not None and self.last_psd_max is not None:
+                n = min(len(self.last_freq_axis), len(self.last_psd_max))
+                self.freq_curve_max.setData(self.last_freq_axis[:n], self.last_psd_max[:n])
+            self.freq_curve_max.setVisible(enable)
+
+    def _toggle_marker(self, state):
+        visible = state != 0
+        if self.marker_line_v:
+            self.marker_line_v.setVisible(visible)
+        if self.marker_line_h:
+            self.marker_line_h.setVisible(visible)
+        if self.marker_label:
+            self.marker_label.setVisible(visible)
+
     def toggle_mode(self):
         """Toggle between real-time and max-hold display modes."""
         self.worker.max_hold_mode = not self.worker.max_hold_mode
@@ -559,18 +777,25 @@ class MainWindow(QMainWindow):
 
     def clear_max_hold(self):
         """Clear max-hold buffer to minimum values."""
-        self.worker.psd_max = -120.0 * np.ones(default_config.processing.fft_size)
+        for window in getattr(self.worker, "windows", []):
+            if hasattr(window.processor, "psd_max"):
+                window.processor.psd_max = -120.0 * np.ones_like(window.processor.psd_max)
 
     def auto_range(self):
         """Auto-range waterfall levels based on spectrogram statistics."""
-        if hasattr(self.worker, "spectrogram"):
-            sigma = np.std(self.worker.spectrogram)
-            mean = np.mean(self.worker.spectrogram)
-            self.spectrogram_min = mean - 2 * sigma
-            self.spectrogram_max = mean + 2 * sigma
+        spectrogram = self.last_waterfall_data
+        if spectrogram is not None:
+            # dostosuj do aktualnej mocy: min/max z danych (z lekkim marginesem)
+            vmin = float(np.min(spectrogram))
+            vmax = float(np.max(spectrogram))
+            margin = 1.0
+            self.spectrogram_min = vmin - margin
+            self.spectrogram_max = vmax + margin
             self.wf_min_spin.setValue(self.spectrogram_min)
             self.wf_max_spin.setValue(self.spectrogram_max)
             self.imageitem.setLevels((self.spectrogram_min, self.spectrogram_max))
+            if self.colorbar:
+                self.colorbar.setLevels((self.spectrogram_min, self.spectrogram_max))
 
     def update_waterfall_levels(self):
         """Apply user-specified waterfall min/max levels to the display."""
@@ -579,6 +804,16 @@ class MainWindow(QMainWindow):
         self.imageitem.setLevels((self.spectrogram_min, self.spectrogram_max))
         self.colorbar.setLevels((self.spectrogram_min, self.spectrogram_max))
 
+    def _apply_waterfall_cmap(self, cmap_name: str):
+        """Change waterfall colormap and update colorbar."""
+        try:
+            cmap = pg.colormap.get(cmap_name)
+        except KeyError:
+            return
+        self.imageitem.setLookupTable(cmap.getLookupTable(0.0, 1.0, 1024))
+        if self.colorbar:
+            self.colorbar.setColorMap(cmap)
+
     def on_time_update(self, samples):
         """Receive time-domain samples and update traces."""
         self.time_curve_i.setData(samples.real)
@@ -586,26 +821,109 @@ class MainWindow(QMainWindow):
 
     def on_freq_update(self, psd):
         """Update frequency-domain plot with new PSD data."""
-        center_mhz = self.worker.freq_khz / 1e3
+        # Unpack raw (current) and averaged PSD
+        if isinstance(psd, tuple):
+            raw_psd, avg_psd = psd
+        else:
+            raw_psd, avg_psd = psd, None
+
+        psd_len = len(raw_psd) if raw_psd is not None else len(avg_psd) if avg_psd is not None else 0
+        center_mhz = self.worker.center_freq / 1e3
         f = np.linspace(
-            center_mhz - (self.worker.sample_rate / 2) / 1e6,
-            center_mhz + (self.worker.sample_rate / 2) / 1e6,
-            len(psd),
+            center_mhz - (self.worker.span / 2) / 1e6,
+            center_mhz + (self.worker.span / 2) / 1e6,
+            psd_len,
         )
-        self.freq_curve.setData(f, psd)
+
+        current_psd = raw_psd if raw_psd is not None else avg_psd
+
+        if current_psd is not None and psd_len > 0:
+            self.freq_curve_current.setData(f, current_psd)
+            self.last_freq_axis = f
+            self.last_psd_current = current_psd
+
+        # build concatenated avg/max to match current length
+        windows = getattr(self.worker, "windows", [])
+        if windows:
+            max_concat = []
+            if avg_psd is not None and psd_len > 0:
+                self.freq_curve_avg.setData(f, avg_psd)
+                self.last_psd_avg = avg_psd
+            else:
+                avg_concat = []
+                for w in windows:
+                    proc = getattr(w, "processor", None)
+                    if proc is None:
+                        continue
+                    if hasattr(proc, "psd_avg"):
+                        avg_concat.append(proc.psd_avg)
+                    if hasattr(proc, "psd_max"):
+                        max_concat.append(proc.psd_max)
+                if avg_concat:
+                    avg_full = np.concatenate(avg_concat)
+                    avg_full = avg_full[: len(f)]
+                    self.freq_curve_avg.setData(f[: len(avg_full)], avg_full)
+                    self.last_psd_avg = avg_full
+                if max_concat:
+                    max_full = np.concatenate(max_concat)
+                    max_full = max_full[: len(f)]
+                    self.freq_curve_max.setData(f[: len(max_full)], max_full)
+                    self.last_psd_max = max_full
+            # Max hold from processors
+            if not max_concat:
+                for w in windows:
+                    proc = getattr(w, "processor", None)
+                    if proc is None or not hasattr(proc, "psd_max"):
+                        continue
+                    max_concat.append(proc.psd_max)
+                if max_concat:
+                    max_full = np.concatenate(max_concat)
+                    max_full = max_full[: len(f)]
+                    self.freq_curve_max.setData(f[: len(max_full)], max_full)
+                    self.last_psd_max = max_full
+        else:
+            self.last_psd_avg = None
+            self.last_psd_max = None
+
+        # marker: jeśli ustawiony, odczytaj aktualną wartość PSD w pobliżu i zaktualizuj opis
+        if self.marker_freq_mhz is not None and current_psd is not None and psd_len > 0:
+            idx = int(np.argmin(np.abs(f - self.marker_freq_mhz)))
+            idx = max(0, min(psd_len - 1, idx))
+            power_val = current_psd[idx]
+            self.marker_power_dbm = power_val
+            voltage_text = self._dbm_to_voltage_text(power_val)
+            if self.marker_line_v:
+                self.marker_line_v.setValue(self.marker_freq_mhz)
+            if self.marker_line_h:
+                self.marker_line_h.setValue(power_val)
+            if self.marker_label:
+                self.marker_label.setText(
+                    f"f={self.marker_freq_mhz:.3f} MHz, P={power_val:.2f} dBm, {voltage_text}"
+                )
+                self.marker_label.setPos(self.marker_freq_mhz, power_val)
 
     def on_waterfall_update(self, spectrogram):
         """Update waterfall image with new spectrogram data."""
         self.imageitem.setImage(spectrogram, autoLevels=False)
+        self.last_waterfall_data = spectrogram
+        # zsynchronizuj prostokąt z aktualnym spanem po wstawieniu danych
+        center_mhz = self.worker.center_freq / 1e3
+        span_hz = self.worker.span
+        start_mhz = center_mhz - span_hz / 2e6
+        stop_mhz = center_mhz + span_hz / 2e6
+        width_mhz = stop_mhz - start_mhz
+        if self.imageitem and getattr(self.imageitem, "image", None) is not None:
+            self.imageitem.setRect(QRectF(start_mhz, 0, width_mhz, spectrogram.shape[0]))
+            self.imageitem.update()
 
     def on_status_update(self, message):
         """Display status messages from the worker in the UI."""
         self.status_label.setText(message)
 
-    def on_performance_update(self, fps):
-        """Update FPS display in the UI."""
-        self.current_fps = fps
-        self.performance_label.setText(f"FPS: {fps:.1f}")
+    def on_sweep_time_update(self, sweep_ms):
+        """Update sweep time display in the UI."""
+        self.current_sweep_ms = sweep_ms
+        self.performance_label.setText(f"Sweep time: {sweep_ms:.1f} ms")
 
     def schedule_worker(self):
         """Schedule worker.run to be called by the Qt event loop."""
@@ -629,3 +947,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):  # pylint: disable=invalid-name
         """Qt close event handler."""
         self.close_event(event)
+
+    def _dbm_to_voltage_text(self, power_dbm: float, impedance_ohm: float = 50.0) -> str:
+        """Convert dBm to Vrms for a given impedance (best-effort, uncalibrated)."""
+        # power_dbm -> watts
+        power_w = 1e-3 * (10.0 ** (power_dbm / 10.0))
+        # Vrms = sqrt(P * R)
+        v_rms = math.sqrt(power_w * impedance_ohm)
+        return f"V≈{v_rms*1e3:.2f} mVrms"

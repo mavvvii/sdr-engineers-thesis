@@ -1,435 +1,269 @@
-"""Core SDR worker: capture and process samples from HackRF and emit Qt signals.
+"""Core SDR worker: capture/process samples and emit Qt signals."""
 
-This module implements the SDRWorker QObject which runs the capture and
-processing pipeline. It also contains optional numba/fastfft accelerated
-functions.
-"""
+# pylint: disable=R0902, R0904, R0915
 
-#  pylint: disable=R0902, R0904, R0915
-
-import sys
 import threading
+from pathlib import Path
+from dataclasses import dataclass
 from queue import Queue
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
-from hackrf import HackRF
-from PyQt6.QtCore import QElapsedTimer, QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 
+from sdr_engineers_thesis.core.hackrf_device import HackRFDevice
+from sdr_engineers_thesis.core.signal_processor import SignalProcessor
 from sdr_engineers_thesis.utils.config import default_config
 
-# USTAWIENIA DLA MAKSYMALNEJ WYDANOŚCI
-FFT_SIZE = default_config.processing.fft_size  # DUŻE FFT
-NUM_ROWS = default_config.processing.num_rows  # MNIEJSZY WATERFALL
-OVERLAP_RATIO = default_config.processing.overlap_ratio  # MNIEJSZE NAKŁADANIE
+# Stałe konfiguracyjne
+NUM_ROWS = default_config.processing.num_rows
+OVERLAP_RATIO = default_config.processing.overlap_ratio
+MAX_DEVICE_SPAN_HZ = 20_000_000  # HackRF One limitation
 
-CENTER_FREQ = default_config.hardware.center_freq
-SAMPLE_RATES = default_config.hardware.sample_rates  # MNIEJ OPCJI
-SAMPLE_RATE = default_config.hardware.sample_rate
+
+SAMPLE_RATES = default_config.hardware.sample_rates
 TIME_PLOT_SAMPLES = default_config.processing.time_plot_samples
-GAIN = default_config.hardware.gain
 
-# OPTYMALIZACJE
-USE_FASTFFT = default_config.optimization.use_fastfft
-USE_NUMBA = default_config.optimization.use_numba
+# Flagi optymalizacji
 USE_OVERLAP = default_config.optimization.use_overlap
 
-# SPRÓBUJ ZAIMPORTOWAĆ OPTYMALIZACJE
-try:
-    from sdr_engineers_thesis.cpp_modules import fastfft  # type: ignore[attr-defined]
 
-    USE_FASTFFT = True
-    print("✓ Using ULTRA FAST fastfft (FFTW3 with caching)")
-except ImportError as e:
-    print("✗ fastfft not available:", e)
-    USE_FASTFFT = False
+@dataclass
+class WindowPlan:
+    center_hz: float
+    span_hz: int
+    fft_size: int
+    overlap: int
+    processor: SignalProcessor
 
-# NUMBA FUNCTIONS - defined conditionally
-if USE_NUMBA:
-    try:
-        from numba import jit
-
-        # PRE-KOMPILACJA WSZYSTKICH FUNKCJI
-        @jit(nopython=True, fastmath=True, cache=True, nogil=True)
-        def numba_fft_shift_abs_log(x, fft_size_val):
-            """Return PSD in dB computed with FFT, shifted to center.
-
-            Args:
-                x: input complex samples.
-                fft_size_val: FFT length used for normalization.
-
-            Returns:
-                Array of PSD values in dB.
-            """
-            fft_data = np.fft.fft(x)
-            fft_shifted = np.fft.fftshift(fft_data)
-            return 10.0 * np.log10((np.abs(fft_shifted) ** 2) / float(fft_size_val) + 1e-12)
-
-        @jit(nopython=True, fastmath=True, cache=True, nogil=True)
-        def apply_window_numba(samples, window):
-            """Apply window to samples element-wise.
-
-            This is a tiny helper kept for numba compilation.
-            """
-            return samples * window
-
-        @jit(nopython=True, fastmath=True, cache=True, nogil=True)
-        def calculate_channel_power_numba(psd, start_idx, end_idx):
-            """Calculate linear power from PSD between indices [start_idx, end_idx)."""
-            total = 0.0
-            for i in range(start_idx, end_idx):
-                total += 10.0 ** (psd[i] / 10.0)
-            return total
-
-        @jit(nopython=True, fastmath=True, cache=True, nogil=True)
-        def moving_average_numba(current, previous, alpha):
-            """Compute single-step exponential moving average (numba)."""
-            return previous * alpha + current * (1.0 - alpha)
-
-        @jit(nopython=True, fastmath=True, cache=True, nogil=True)
-        def max_hold_numba(current, previous):
-            """Compute element-wise max hold between current and previous arrays."""
-            for i, curr_val in enumerate(current):
-                if curr_val > previous[i]:
-                    previous[i] = curr_val
-            return previous
-
-        # PRE-KOMPILACJA
-        print("Pre-kompilowanie funkcji numba...")
-        test_data = np.random.randn(FFT_SIZE).astype(np.complex128)
-        test_window = np.hanning(FFT_SIZE)
-        test_psd = np.random.randn(FFT_SIZE).astype(np.float32)
-        numba_fft_shift_abs_log(test_data, FFT_SIZE)
-        apply_window_numba(test_data, test_window)
-        calculate_channel_power_numba(test_psd, 0, 100)
-        moving_average_numba(test_psd, test_psd, 0.8)
-        max_hold_numba(test_psd, test_psd)
-        print("✓ Pre-kompilacja zakończona")
-
-    except ImportError as e:
-        print("✗ numba not available:", e)
-        USE_NUMBA = False
-else:
-    # Fallback functions when numba is not available
-    def apply_window_numba(samples, window):
-        """Apply window to samples element-wise (fallback)."""
-        return samples * window
-
-    def calculate_channel_power_numba(psd, start_idx, end_idx):
-        """Calculate linear power from PSD between indices [start_idx, end_idx) (fallback)."""
-        return np.sum(10.0 ** (psd[start_idx:end_idx] / 10.0))
-
-    def moving_average_numba(current, previous, alpha):
-        """Compute single-step exponential moving average (fallback)."""
-        return previous * alpha + current * (1.0 - alpha)
-
-    def max_hold_numba(current, previous):
-        """Compute element-wise max hold between current and previous arrays (fallback)."""
-        return np.maximum(previous, current)
-
-
-# INICJALIZACJA HACKRF
-SDR_DEVICE = None
-try:
-    SDR_DEVICE = HackRF()
-    SDR_DEVICE.sample_rate = SAMPLE_RATE
-    SDR_DEVICE.center_freq = CENTER_FREQ
-    SDR_DEVICE.set_lna_gain(GAIN)
-    SDR_DEVICE.set_vga_gain(16)
-    print("✓ HackRF initialized successfully")
-except (OSError, IOError, ValueError, AttributeError) as e:
-    print(f"✗ HackRF initialization failed: {e}")
-    sys.exit(1)
 
 
 class SDRWorker(QObject):
-    """SDR data capture and processing worker (runs in a background thread).
-
-    This QObject exposes Qt signals for UI updates and runs a capture loop that
-    enqueues frames for processing.
-    """
+    """Worker: pobiera próbki z HackRF, przetwarza i emituje sygnały Qt."""
 
     time_plot_update = pyqtSignal(object)
     freq_plot_update = pyqtSignal(object)
     waterfall_plot_update = pyqtSignal(object)
     status_update = pyqtSignal(str)
-    performance_update = pyqtSignal(float)
+    sweep_time_update = pyqtSignal(float)
     channel_power_update = pyqtSignal(float)
     end_of_run = pyqtSignal()
 
     def __init__(self):
-        """Create SDRWorker and start background processing thread."""
         super().__init__()
 
-        # Core SDR settings
-        self.gain = GAIN
-        self.sample_rate = SAMPLE_RATE
-        self.freq_khz = int(CENTER_FREQ / 1e3)
+        self.lna_gain = default_config.hardware.lna_gain
+        self.vga_gain = default_config.hardware.vga_gain
+        self.gain = self.vga_gain  # backward compatibility with UI naming
+        self.span = default_config.hardware.span
+        self.center_freq = default_config.hardware.center_freq / 1e3
+        self.fft_size = default_config.processing.fft_size
 
-        # Processing state
         self.max_hold_mode = False
         self.running = True
-        self.fft_averages = 1
-        self.waterfall_speed = 2  # Domyslnie co 2 klatki
+        self.waterfall_speed = 2
         self.waterfall_counter = 0
-        self.overlap_samples = int(FFT_SIZE * OVERLAP_RATIO)
-        self.last_samples: Optional[np.ndarray] = None
+        self.windows: List[WindowPlan] = []
+        self.last_samples: List[Optional[np.ndarray]] = []
+        self.waterfall_buffer: Optional[np.ndarray] = None
 
-        # Channel power measurement
-        self.channel_start_freq = 99.7e6
-        self.channel_end_freq = 100.0e6
+        self.channel_start_freq = default_config.measurement.channel_start_freq
+        self.channel_end_freq = default_config.measurement.channel_end_freq
         self.channel_power = 0.0
-        self.channel_indices: Optional[Tuple[int, int]] = None
 
-        # Sweep settings
-        self.sweep_time_seconds = 0.0  # Sweep time in seconds (0 = disabled)
+        # Opcjonalny plik kalibracyjny dla przeliczeń mocy
+        self.calibration_file = str(
+            Path(__file__).resolve().parent.parent / "measurement" / "far_measurement.txt"
+        )
 
-        # Multi-threading
-        self.sample_queue = Queue(maxsize=4)  # MNIEJSZA KOLEJKA
+        self.sample_queue = Queue(maxsize=4)
         self.processing_thread: Optional[threading.Thread] = None
         self.processing_running = True
-
-        # Performance statistics
-        self.processing_times = np.zeros(10, dtype=np.float32)
-        self.time_index = 0
         self.frame_counter = 0
 
-        self.psd_avg = None
-        self.psd_max = None
-
-        # Initialize data buffers and arrays
-        self._initialize_data_arrays()
+        self._refresh_window_plan()
+        # init device on first window
+        first_window = self.windows[0]
+        self.device = HackRFDevice(
+            first_window.span_hz,
+            first_window.center_hz,
+            self.lna_gain,
+            self.vga_gain,
+        )
 
         self.start_processing_thread()
-        self.update_channel_indices()  # Oblicz indeksy kanału na start
-
-    def _initialize_data_arrays(self):
-        """Initialize all data arrays to avoid too many instance attributes in __init__."""
-        # PRE-ALOKACJA WSZYSTKICH TABLIC
-        self.spectrogram = np.full((NUM_ROWS, FFT_SIZE), -120.0, dtype=np.float32)
-        self.psd_avg = np.full(FFT_SIZE, -120.0, dtype=np.float32)
-        self.psd_max = np.full(FFT_SIZE, -120.0, dtype=np.float32)
-        self.window = np.hanning(FFT_SIZE).astype(np.float32)
-        self.spectrum_history = np.zeros((2, FFT_SIZE), dtype=np.float32)  # Tylko 2 ramki historii
-
-        # OPTYMALIZACJE
-        self.fft_buffer = np.zeros(FFT_SIZE, dtype=np.complex128)
-        self.psd_buffer = np.zeros(FFT_SIZE, dtype=np.float32)
+        self.update_channel_indices()
 
     def start_processing_thread(self):
-        """Start the background processing thread."""
         self.processing_thread = threading.Thread(target=self.processing_loop, daemon=True)
         self.processing_thread.start()
 
     def processing_loop(self):
-        """Thread loop that consumes sample_queue and processes frames."""
         while self.processing_running:
             try:
-                samples = self.sample_queue.get(timeout=0.01)  # KRÓTSZY TIMEOUT
-                if samples is not None:
-                    self.process_samples_ultra_fast(samples)
+                sample_batch = self.sample_queue.get(timeout=0.01)
+                if sample_batch:
+                    self.process_samples_ultra_fast(sample_batch)
             except Exception:  # pylint: disable=broad-except
-                # timeout or queue empty; continue looping
                 continue
 
+    def _window_fft_size(self, window_span: int) -> int:
+        """Scale FFT size per okno, zachowując RBW ~ span/fft_size."""
+        scaled = int(max(128, (self.fft_size * window_span) / max(1, self.span)))
+        # najbliższa potęga dwójki dla szybkości
+        return 1 << (scaled - 1).bit_length()
+
+    def _refresh_window_plan(self):
+        """Split span na okna <=20 MHz i odśwież bufory."""
+        self.windows = []
+        start_freq = self.center_freq * 1e3 - self.span / 2
+        remaining = self.span
+        current_start = start_freq
+        while remaining > 0:
+            window_span = int(min(MAX_DEVICE_SPAN_HZ, remaining))
+            center = current_start + window_span / 2
+            fft_size = self._window_fft_size(window_span)
+            print(fft_size)
+            overlap = int(fft_size * OVERLAP_RATIO)
+            processor = SignalProcessor(
+                fft_size,
+                NUM_ROWS,
+                TIME_PLOT_SAMPLES,
+                window_span,
+                calibration_file=self.calibration_file,
+            )
+            processor.set_center_freq_khz(int(center / 1e3))
+            processor.set_channel_range(self.channel_start_freq, self.channel_end_freq)
+            self.windows.append(WindowPlan(center_hz=center, span_hz=window_span, fft_size=fft_size, overlap=overlap, processor=processor))
+            current_start += window_span
+            remaining -= window_span
+
+        total_bins = sum(w.fft_size for w in self.windows)
+        self.waterfall_buffer = np.full((NUM_ROWS, total_bins), -120.0, dtype=np.float32)
+        self.last_samples = [None] * len(self.windows)
+
+    def _apply_window_to_device(self, window: WindowPlan):
+        """Ustaw parametry urządzenia dla danego okna."""
+        try:
+            self.device.set_span(window.span_hz)
+            self.device.set_center_freq(window.center_hz)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     def update_channel_indices(self):
-        """Oblicz i cache'uj indeksy kanału - WYWOŁUJ TYLKO GDY ZMIENIASZ CZĘSTOTLIWOŚĆ."""
-        freq_resolution = self.sample_rate / FFT_SIZE
-        center_freq_hz = self.freq_khz * 1e3
-
-        start_offset = self.channel_start_freq - center_freq_hz
-        end_offset = self.channel_end_freq - center_freq_hz
-
-        start_idx = int(FFT_SIZE / 2 + start_offset / freq_resolution)
-        end_idx = int(FFT_SIZE / 2 + end_offset / freq_resolution)
-
-        # Zabezpieczenie zakresu
-        start_idx = max(0, min(FFT_SIZE - 1, start_idx))
-        end_idx = max(0, min(FFT_SIZE - 1, end_idx))
-
-        if start_idx >= end_idx:
-            start_idx, end_idx = 0, 0
-
-        self.channel_indices = (start_idx, end_idx)
+        for window in self.windows:
+            window.processor.set_center_freq_khz(int(window.center_hz / 1e3))
+            window.processor.set_sample_rate(window.span_hz)
+            window.processor.set_channel_range(self.channel_start_freq, self.channel_end_freq)
 
     def set_channel_freq_range(self, start_freq, end_freq):
-        """Set the frequency range (Hz) for channel power measurement.
-
-        Args:
-            start_freq: start frequency in Hz.
-            end_freq: end frequency in Hz.
-        """
         self.channel_start_freq = start_freq
         self.channel_end_freq = end_freq
         self.update_channel_indices()
 
-    def update_freq(self, val_khz):
-        """Update the tuned frequency (kHz) and refresh channel indices."""
-        self.freq_khz = int(val_khz)
-        if SDR_DEVICE is not None:
-            SDR_DEVICE.center_freq = int(self.freq_khz * 1e3)
-        self.update_channel_indices()  # Odśwież indeksy przy zmianie częstotliwości
-        self.status_update.emit(f"Frequency: {self.freq_khz} kHz")
+    def set_fft_averages(self, n: int):
+        """Set number of FFT averages (kept for UI compatibility)."""
+        self.fft_averages = max(1, int(n))
+
+    def update_center_freq(self, val_khz):
+        self.center_freq = int(val_khz)
+        self._refresh_window_plan()
+        if self.device is not None and self.windows:
+            self._apply_window_to_device(self.windows[0])
+        self.update_channel_indices()
+        self.status_update.emit(f"Frequency: {self.center_freq} kHz")
 
     def update_gain(self, val):
-        """Update receiver gain (LNA)."""
         self.gain = val
-        if SDR_DEVICE is not None:
-            SDR_DEVICE.set_lna_gain(int(val))
+        self.vga_gain = val
+        if self.device is not None:
+            self.device.set_vga_gain(int(val))
 
     def update_sample_rate(self, index):
-        """Update sample rate by index into sample_rates list."""
         new_sr = int(SAMPLE_RATES[index] * 1e6)
-        self.sample_rate = new_sr
-        if SDR_DEVICE is not None:
-            SDR_DEVICE.sample_rate = new_sr
-        self.update_channel_indices()  # Odśwież indeksy przy zmianie sample rate
+        self.update_span_value(new_sr)
 
-    def update_sample_rate_value(self, sr_hz: int):
-        """Set sample rate directly (sr_hz in Hz). Enforces sane bounds and updates SDR."""
-        # enforce bounds 100 Hz .. 100 MHz
-        sr_hz = int(max(100, min(100_000_000, int(sr_hz))))
-        self.sample_rate = sr_hz
+    #DONE
+    def update_span_value(self, span_value: int):
+        #SPAN RANGE 100-100MHz
+        span_value = int(max(100, min(100_000_000, int(span_value))))
+        self.span = span_value
+
+        self._refresh_window_plan()
         try:
-            if SDR_DEVICE is not None:
-                SDR_DEVICE.sample_rate = sr_hz
+            if self.device is not None and self.windows:
+                self._apply_window_to_device(self.windows[0])
         except Exception:  # pylint: disable=broad-except
             pass
-        # recalc channel indices after changing sample rate
         self.update_channel_indices()
         try:
-            self.status_update.emit(f"Sample rate set: {self.sample_rate} Hz")
+            self.status_update.emit(f"Sample rate set: {self.span} Hz")
         except Exception:  # pylint: disable=broad-except
             pass
 
-    def set_fft_averages(self, n):
-        """Set the number of FFT averages used in smoothing."""
-        self.fft_averages = max(1, n)
+    def set_fft_size(self, fft_size: int):
+        fft_size = int(max(128, min(10_000_000, fft_size)))
+        if fft_size == self.fft_size:
+            return
+        self.fft_size = fft_size
+        self._refresh_window_plan()
+        if self.device is not None and self.windows:
+            self._apply_window_to_device(self.windows[0])
+        self.update_channel_indices()
 
     def set_waterfall_speed(self, speed):
-        """Set waterfall update speed in frames."""
         self.waterfall_speed = max(1, speed)
 
     def stop(self):
-        """Stop processing and exit background threads gracefully."""
         self.running = False
         self.processing_running = False
 
-    def calculate_channel_power_fast(self, psd):
-        """Compute channel power (dBm) using cached channel indices.
+    def process_samples_ultra_fast(self, samples_batch: List[np.ndarray]):
+        combined_psd = []
+        combined_time = None
+        combined_power = 0.0
+        sweep_time_ms = 0.0
 
-        Returns 0.0 if indices are invalid.
-        """
-        if self.channel_indices is None or self.channel_indices[0] >= self.channel_indices[1]:
-            return 0.0
+        raw_psd_blocks = []
+        for window, samples in zip(self.windows, samples_batch):
+            result = window.processor.process(samples, self.max_hold_mode)
+            combined_psd.append(result.display_psd)
+            raw_psd_blocks.append(result.raw_psd)
+            combined_power = max(combined_power, result.channel_power)
+            sweep_time_ms = max(sweep_time_ms, result.sweep_time_ms)
+            if combined_time is None:
+                combined_time = result.time_samples
 
-        start_idx, end_idx = self.channel_indices
+        full_psd = np.concatenate(combined_psd) if combined_psd else np.array([], dtype=np.float32)
+        raw_psd_full = np.concatenate(raw_psd_blocks) if raw_psd_blocks else np.array([], dtype=np.float32)
 
-        freq_resolution = self.sample_rate / FFT_SIZE
-
-        if USE_NUMBA:
-            power_linear = calculate_channel_power_numba(psd, start_idx, end_idx)
-        else:
-            # Szybsza wersja bez numba
-            power_linear = np.sum(10.0 ** (psd[start_idx:end_idx] / 10.0))
-
-        # return 10.0 * np.log10(power_linear) + 30.0
-        power_watts = power_linear * freq_resolution
-        power_dbm = 10.0 * np.log10(power_watts / 0.001 + 1e-12)
-
-        return power_dbm
-
-    def process_samples_ultra_fast(self, samples):
-        """Process a frame of complex samples and emit plot/update signals."""
-        timer = QElapsedTimer()
-        timer.start()
-
-        # 1. KONWERSJA I USUWANIE DC
-        samples = np.asarray(samples, dtype=np.complex64)
-        samples -= np.mean(samples)
-
-        # 2. OKIENKOWANIE
-        if USE_NUMBA:
-            samples_windowed = apply_window_numba(samples.astype(np.complex128), self.window)
-        else:
-            samples_windowed = samples.astype(np.complex128) * self.window
-
-        # 3. FFT - NAJSZYBSZA MOŻLIWA ŚCIEŻKA
-        if USE_FASTFFT:
-            # ULTRA FAST - bezpośrednie wywołanie z cachingiem
-            fft_data = fastfft.fft(samples_windowed)
-            fft_shifted = np.fft.fftshift(fft_data)
-            psd = 10.0 * np.log10((np.abs(fft_shifted) ** 2) / float(FFT_SIZE) + 1e-12)
-        elif USE_NUMBA:
-            # FAST - numba JIT
-            psd = numba_fft_shift_abs_log(samples_windowed, FFT_SIZE)
-        else:
-            # SLOW - numpy fallback
-            fft_data = np.fft.fft(samples_windowed)
-            fft_shifted = np.fft.fftshift(fft_data)
-            psd = 10.0 * np.log10((np.abs(fft_shifted) ** 2) / float(FFT_SIZE) + 1e-12)
-
-        psd = psd.astype(np.float32)
-
-        # 4. UŚREDNIANIE/MAX HOLD
-        if self.max_hold_mode:
-            if USE_NUMBA:
-                self.psd_max = max_hold_numba(psd, self.psd_max)
-                display_psd = self.psd_max
-            else:
-                self.psd_max = np.maximum(self.psd_max, psd)
-                display_psd = self.psd_max
-        else:
-            if USE_NUMBA:
-                self.psd_avg = moving_average_numba(psd, self.psd_avg, 0.7)
-                display_psd = self.psd_avg
-            else:
-                self.psd_avg = self.psd_avg * 0.7 + psd * 0.3
-                display_psd = self.psd_avg
-
-        # 5. POMIAR MOCY - ULTRA FAST
-        self.channel_power = self.calculate_channel_power_fast(display_psd)
+        self.channel_power = combined_power
         self.channel_power_update.emit(self.channel_power)
 
-        # 6. EMITUJ WYNIKI
-        self.freq_plot_update.emit(display_psd)
+        self.freq_plot_update.emit((raw_psd_full, full_psd))
 
-        # 7. WYKRES CZASU CO 4 KLATKI
-        if self.frame_counter % 4 == 0:
-            self.time_plot_update.emit(samples[:TIME_PLOT_SAMPLES])
+        if self.frame_counter % 4 == 0 and combined_time is not None:
+            self.time_plot_update.emit(combined_time)
 
-        # 8. WATERFALL CO waterfal_speed KLATEK
         self.waterfall_counter += 1
-        if self.waterfall_counter >= self.waterfall_speed:
-            # SZYBSZE WATERFALL - unikaj np.roll
-            self.spectrogram[:-1] = self.spectrogram[1:]
-            self.spectrogram[-1] = display_psd
-            self.waterfall_plot_update.emit(self.spectrogram)
+        if self.waterfall_counter >= self.waterfall_speed and self.waterfall_buffer is not None:
+            self.waterfall_buffer[:-1] = self.waterfall_buffer[1:]
+            if full_psd.size > 0:
+                self.waterfall_buffer[-1, :] = -120.0
+                self.waterfall_buffer[-1, : full_psd.size] = full_psd
+            self.waterfall_plot_update.emit(self.waterfall_buffer)
             self.waterfall_counter = 0
 
-        # 9. STATYSTYKI WYDANOŚCI
-        processing_time = timer.elapsed()
-        self.processing_times[self.time_index] = processing_time
-        self.time_index = (self.time_index + 1) % len(self.processing_times)
-
-        avg_time = np.mean(self.processing_times)
-        fps = 1000.0 / avg_time if avg_time > 0 else 0
-        self.performance_update.emit(fps)
+        self.sweep_time_update.emit(sweep_time_ms)
 
         self.frame_counter += 1
 
     def run(self):
-        """Read samples from the SDR device and enqueue them for processing.
-
-        Handles overlap reads and emits status updates on errors.
-        """
         if not self.running:
             return
 
         try:
-            # ODCZYT PRÓBEK Z NAKŁADANIEM
-            if SDR_DEVICE is None:
-                # Device not initialized; emit status and stop this run.
+            if self.device is None or self.device.device is None:
                 try:
                     self.status_update.emit("SDR device not initialized.")
                 except Exception:  # pylint: disable=broad-except
@@ -437,17 +271,21 @@ class SDRWorker(QObject):
                 self.end_of_run.emit()
                 return
 
-            if USE_OVERLAP and self.last_samples is not None:
-                new_samples = SDR_DEVICE.read_samples(FFT_SIZE - self.overlap_samples)
-                samples = np.concatenate((self.last_samples[-self.overlap_samples :], new_samples))
-            else:
-                samples = SDR_DEVICE.read_samples(FFT_SIZE)
+            sample_batch: List[np.ndarray] = []
+            for idx, window in enumerate(self.windows):
+                self._apply_window_to_device(window)
+                overlap = window.overlap if USE_OVERLAP else 0
+                read_size = max(1, window.fft_size - overlap)
+                new_samples = self.device.read(read_size)
+                if USE_OVERLAP and self.last_samples[idx] is not None and overlap > 0:
+                    samples = np.concatenate((self.last_samples[idx][-overlap:], new_samples))
+                else:
+                    samples = new_samples
+                self.last_samples[idx] = samples
+                sample_batch.append(samples)
 
-            self.last_samples = samples
-
-            # DODAJ DO KOLEJKI (NON-BLOCKING)
-            if not self.sample_queue.full():
-                self.sample_queue.put(samples)
+            if sample_batch and not self.sample_queue.full():
+                self.sample_queue.put(sample_batch)
 
         except Exception as e:  # pylint: disable=broad-except
             self.status_update.emit(f"Read error: {str(e)}")

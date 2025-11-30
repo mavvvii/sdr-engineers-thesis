@@ -8,7 +8,7 @@ class HackRFInitializationError(Exception):
     """Custom exception for HackRF initialization errors."""
 
 
-class HackRFDevice:
+class HackRFDevice(HackRF):
     """Initialization and control of HackRF device.
 
     Attributes:
@@ -22,13 +22,14 @@ class HackRFDevice:
         read: Read samples from the device.
     """
 
-    def __init__(self, span: int, center_freq: float, gain: int) -> None:
+    def __init__(self, span: int, center_freq: float, lna_gain: int, vga_gain: int) -> None:
         """Initialize HackRF device with specified settings.
 
         Args:
             span: Sample rate in samples per second.
             center_freq: Center frequency in Hz.
-            gain: LNA gain in dB.
+            lna_gain: LNA gain in dB.
+            vga_gain: VGA gain in dB.
 
         Returns:
             None
@@ -37,9 +38,9 @@ class HackRFDevice:
             self.device: HackRF = HackRF()
             self.set_span(span)
             self.set_center_freq(center_freq)
-            self.set_lna_gain(gain)
-            self.set_vga_gain(16)
-
+            self.set_lna_gain(lna_gain)
+            self.set_vga_gain(vga_gain)
+            self.device.disable_amp()
             print("✓ HackRF initialized successfully")
         except (OSError, IOError, ValueError, AttributeError) as e:
             raise HackRFInitializationError(f"Failed to initialize HackRF device: {e}") from e
