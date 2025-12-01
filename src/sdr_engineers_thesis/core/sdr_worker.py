@@ -88,8 +88,8 @@ class SDRWorker(QObject):
             first_window.span_hz,
             first_window.center_hz,
             self.lna_gain,
-            self.vga_gain,
         )
+        self.device.set_vga_gain(self.vga_gain)
 
         self.start_processing_thread()
         self.update_channel_indices()
@@ -263,7 +263,7 @@ class SDRWorker(QObject):
             return
 
         try:
-            if self.device is None or self.device.device is None:
+            if self.device is None:
                 try:
                     self.status_update.emit("SDR device not initialized.")
                 except Exception:  # pylint: disable=broad-except

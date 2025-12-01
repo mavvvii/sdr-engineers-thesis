@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
         # Status labels
         self.status_label = QLabel("Ready")
         self.performance_label = QLabel("Sweep time: -- ms")
+        self.fft_label = QLabel("FFT size: --")
+        
         self.channel_power_label = QLabel("Channel Power: -- dBm")
 
         # Frequency controls (center)
@@ -264,9 +266,21 @@ class MainWindow(QMainWindow):
         status_layout = QVBoxLayout()
         status_layout.addWidget(self.status_label)
         status_layout.addWidget(self.performance_label)
+        status_layout.addWidget(self.fft_label)
         status_layout.addWidget(self.channel_power_label)
         status_group.setLayout(status_layout)
         parent_layout.addWidget(status_group)
+
+    def _update_fft_label(self):
+        """Update displayed FFT size from worker state."""
+        try:
+            fft = getattr(self.worker, "fft_size", None)
+            if fft is None:
+                self.fft_label.setText("FFT size: --")
+            else:
+                self.fft_label.setText(f"FFT size: {int(fft)}")
+        except Exception:
+            pass
 
     def _create_frequency_group(self, parent_layout):
         """Create frequency settings group."""
@@ -475,6 +489,11 @@ class MainWindow(QMainWindow):
         # Start thread & worker
         self.sdr_thread.started.connect(self.worker.run)
         self.sdr_thread.start()
+        # initialize FFT label from current worker state
+        try:
+            self._update_fft_label()
+        except Exception:
+            pass
 
     def on_center_changed(self, _=None):
         """Update center/span when center frequency changes."""
@@ -656,23 +675,49 @@ class MainWindow(QMainWindow):
 
     def _rbw_step(self, direction: int):
         """Adjust RBW via FFT size steps (direction>0 => większe RBW = mniejsze FFT)."""
-        windows = getattr(self.worker, "windows", [])
-        current_fft = windows[0].fft_size if windows else getattr(self.worker, "fft_size", 8192)
-        if direction > 0:
+        # Operujemy na bazowym FFT workera: + zmniejsza FFT (większe RBW), - zwiększa FFT.
+        try:
+            dir_int = int(direction)
+        except Exception:
+            return
+
+        current_fft = int(getattr(self.worker, "fft_size", default_config.processing.fft_size))
+        if dir_int > 0:
             new_fft = max(128, current_fft // 2)
         else:
             new_fft = min(self.RBW_FFT_MAX, current_fft * 2)
+
         if new_fft == current_fft:
+            span_hz = float(getattr(self.worker, "span", 0))
+            self._update_rbw_display(span_hz)
+            self.status_label.setText(f"FFT size unchanged: {current_fft}")
             return
-        # ustaw FFT i zaktualizuj widoki
+
+        # apply FFT size and update views; keep UI responsive even on error
         try:
             self.worker.set_fft_size(new_fft)
-        except Exception:
-            return
-        span_hz = getattr(self.worker, "span", 0)
-        self._update_rbw_display(span_hz)
-        self._recenter_frequency_view()
-        self.status_label.setText(f"FFT size set to {new_fft}")
+            span_hz = float(getattr(self.worker, "span", 0))
+            windows = getattr(self.worker, "windows", [])
+            window_span = windows[0].span_hz if windows else min(span_hz, self.MAX_DEVICE_SPAN_HZ)
+
+            rbw_hz = float(window_span) / float(max(1, int(windows[0].fft_size if windows else new_fft)))
+            if rbw_hz >= 1e6:
+                text_val, unit = rbw_hz / 1e6, "MHz"
+            elif rbw_hz >= 1e3:
+                text_val, unit = rbw_hz / 1e3, "kHz"
+            else:
+                text_val, unit = rbw_hz, "Hz"
+
+            self.rbw_label.setText(f"RBW: {text_val:.2f} {unit}")
+            self.status_label.setText(f"FFT size set to {new_fft} (RBW≈{text_val:.2f} {unit})")
+            self._update_fft_label()
+            self._recenter_frequency_view()
+        except Exception as exc:  # pylint: disable=broad-except
+            # show error but don't raise — keep UI usable
+            try:
+                self.status_label.setText(f"Failed to set FFT: {exc}")
+            except Exception:
+                pass
 
     def _update_span_display(self, desired_sr):
         """Update SPAN display based on desired sample rate."""

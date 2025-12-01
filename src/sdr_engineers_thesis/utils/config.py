@@ -28,6 +28,10 @@ class SDRSettings:
     gain: int = 16
     lna_gain: int = 32
     vga_gain: int = 16
+    # Test mode: if True, do not attempt to open real HackRF hardware but
+    # instead read IQ samples from `test_iq_file` (raw interleaved int8 I,Q)
+    test_mode: bool = False
+    test_iq_file: str | None = None
 
     def __post_init__(self):
         """Ensure a default span is selected if not provided."""
