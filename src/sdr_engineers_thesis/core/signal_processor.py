@@ -214,26 +214,56 @@ class SignalProcessor:
             return 0.0
         return float(np.interp(freq_hz, self.calib_freqs, self.calib_offsets))
 
+    def _freq_axis_hz(self) -> np.ndarray:
+        """Zwraca wektor częstotliwości (Hz) odpowiadający binom FFT po fftshift."""
+        bin_width = self.sample_rate / self.fft_size
+        start_freq = self.freq_khz * 1e3 - (self.sample_rate / 2.0)
+        return start_freq + bin_width * np.arange(self.fft_size)
+
+    def _smooth_curve(self, curve: np.ndarray, kernel_hz: float = 200_000.0) -> np.ndarray:
+        """
+        Wygładza krzywą konwolucją z oknem Hanninga o zadanej szerokości w Hz,
+        żeby wyeliminować pojedyncze piki po interpolacji.
+        """
+        bin_width = self.sample_rate / self.fft_size
+        kernel_bins = max(1, int(kernel_hz / bin_width))
+        if kernel_bins < 3:
+            return curve
+        if kernel_bins % 2 == 0:
+            kernel_bins += 1  # symetryczne okno
+        window = np.hanning(kernel_bins).astype(np.float32)
+        window /= window.sum()
+        return np.convolve(curve, window, mode="same")
+
     def _apply_calibration_to_psd(self, psd: np.ndarray) -> np.ndarray:
         """
-        Dodaj korektę tylko w punktach kalibracyjnych (najbliższe biny).
-        Każdy punkt z pliku podnosi (lub obniża) jeden bin widma.
+        Interpoluje poprawkę kalibracyjną po całym widmie, żeby uniknąć
+        pojedynczych pików w miejscach punktów pomiarowych.
         """
         if self.calib_freqs is None or self.calib_offsets is None:
             return psd
 
-        freq_resolution = self.sample_rate / self.fft_size
-        center_freq_hz = self.freq_khz * 1e3
-        bin_offsets = (np.arange(self.fft_size) - self.fft_size / 2.0) * freq_resolution
-        freq_axis = center_freq_hz + bin_offsets
+        freq_axis = self._freq_axis_hz()
 
-        psd_calibrated = psd.copy()
+        # Liniowa interpolacja korekty, z wartościami skrajnymi stałymi poza zakresem.
+        offset_curve = np.interp(
+            freq_axis,
+            self.calib_freqs,
+            self.calib_offsets,
+            left=self.calib_offsets[0],
+            right=self.calib_offsets[-1],
+        ).astype(np.float32)
+
+        smoothed_offset = self._smooth_curve(offset_curve)
+
+        # Przywróć wartości dokładnie w punktach kalibracyjnych,
+        # żeby nie tracić poziomu na anchorach po wygładzaniu.
+        freq_axis_hz = freq_axis
         for freq_val, offset_db in zip(self.calib_freqs, self.calib_offsets):
-            idx = int(np.argmin(np.abs(freq_axis - freq_val)))
-            # dodaj korektę tylko jeśli punkt jest w zasięgu jednego binu
-            if abs(freq_axis[idx] - freq_val) <= freq_resolution / 2.0:
-                psd_calibrated[idx] += float(offset_db)
-        return psd_calibrated
+            idx = int(np.argmin(np.abs(freq_axis_hz - freq_val)))
+            smoothed_offset[idx] = float(offset_db)
+
+        return psd + smoothed_offset
 
     def set_center_freq_khz(self, freq_khz: int) -> None:
         self.freq_khz = freq_khz
@@ -269,11 +299,39 @@ class SignalProcessor:
         self.time_index = (self.time_index + 1) % len(self.processing_times)
         return float(np.mean(self.processing_times))
 
+    #pomocnicza
+    def _freq_to_bin(self, freq_hz: float) -> int:
+        freq_resolution = self.sample_rate / self.fft_size  # Hz na bin
+        center_freq_hz = self.freq_khz * 1e3
+
+        # przesunięcie od częstotliwości środkowej
+        offset_hz = freq_hz - center_freq_hz
+
+        # indeks po fftshift: 0..N-1, środek w N/2
+        bin_float = self.fft_size / 2 + offset_hz / freq_resolution
+        bin_idx = int(round(bin_float))
+
+        # zabezpieczenie na zakres
+        bin_idx = max(0, min(self.fft_size - 1, bin_idx))
+        return bin_idx
+
     def _compute_psd(self, samples_windowed: np.ndarray) -> np.ndarray:
         if USE_FASTFFT:
             fft_data = fastfft.fft(samples_windowed)
             fft_shifted = np.fft.fftshift(fft_data)
             psd = 10.0 * np.log10((np.abs(fft_shifted) ** 2) / float(self.fft_size) + 1e-12)
+
+            import datetime
+            now = datetime.datetime.now().replace(microsecond=0)
+            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+            target_freq_hz = 3000.021e6
+            bin_idx = self._freq_to_bin(target_freq_hz)
+            psd_at_freq = psd[bin_idx]
+
+            with open("measurement/measurement_AMPLITUDE_3400_3800_10mhz-step.txt", "a") as f:
+                f.write(f'{timestamp};Power_dbm:{max(psd)}\n')
+
         elif USE_NUMBA:
             psd = numba_fft_shift_abs_log(samples_windowed, self.fft_size)
         else:

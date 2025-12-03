@@ -22,11 +22,11 @@ class SDRSettings:
         vga_gain: VGA gain value.
     """
 
-    center_freq: float = 2442e6
+    center_freq: float = 3400e6
     sample_rates: List[int] = field(default_factory=lambda: [2, 4, 8, 10])  # POPRAWIONE
-    span: int | None = 60e6
+    span: int | None = 1e6
     gain: int = 16
-    lna_gain: int = 32
+    lna_gain: int = 16
     vga_gain: int = 16
     # Test mode: if True, do not attempt to open real HackRF hardware but
     # instead read IQ samples from `test_iq_file` (raw interleaved int8 I,Q)
